@@ -7,7 +7,7 @@ class Ehentai extends ComicSource {
     // unique id of the source
     key = "ehentai"
 
-    version = "1.2.0"
+    version = "1.2.1"
 
     minAppVersion = "1.5.3"
 
@@ -99,8 +99,9 @@ class Ehentai extends ComicSource {
             fields: [
                 "ipb_member_id",
                 "ipb_pass_hash",
+                "cf_clearance",
+                "sk",
                 "igneous",
-                "star",
             ],
             /**
              * Validate cookies, return false if cookies are invalid.
@@ -110,43 +111,55 @@ class Ehentai extends ComicSource {
              * @returns {Promise<boolean>}
              */
             validate: async (values) => {
-                if (values.length !== 4) {
+                const fields = this.account.loginWithCookies.fields
+                if (values.length !== fields.length) {
                     return false
                 }
-                if (values[0].length === 0 || values[1].length === 0) {
+                // ipb_member_id and ipb_pass_hash are mandatory; the rest are optional
+                if (!values[0] || !values[1]) {
                     return false
                 }
                 let cookies = []
                 for (let i = 0; i < values.length; i++) {
+                    if (!values[i]) {
+                        continue // skip blank optional cookies instead of storing empties
+                    }
                     cookies.push(new Cookie({
-                        name: this.account.loginWithCookies.fields[i],
+                        name: fields[i],
                         value: values[i],
                         domain: ".e-hentai.org"
                     }))
                     cookies.push(new Cookie({
-                        name: this.account.loginWithCookies.fields[i],
+                        name: fields[i],
                         value: values[i],
                         domain: ".exhentai.org"
                     }))
                 }
                 Network.deleteCookies('https://e-hentai.org')
                 Network.setCookies('https://e-hentai.org', cookies)
+                Network.setCookies('https://exhentai.org', cookies)
+                // The old check scraped forums.e-hentai.org, but the forum is now behind
+                // anti-bot protection (returns 403 to app clients), so that request never
+                // returned 200 and login always failed with "Invalid cookies". Validate
+                // against the main site instead: home.php requires login — logged-out
+                // visitors get a login form containing "requires you to log on" (plus the
+                // UserName/PassWord inputs), while logged-in users get their account overview.
                 let res = await Network.get(
-                    "https://forums.e-hentai.org/",
+                    "https://e-hentai.org/home.php",
                     {
-                        "referer": "https://forums.e-hentai.org/index.php?",
+                        "referer": "https://e-hentai.org/",
                         "accept":
                             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                        "accept-encoding": "gzip, deflate, br",
                         "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
                     });
                 if (res.status !== 200) {
                     return false
                 }
-                let document = new HtmlDocument(res.body)
-                let name = document.querySelector("div#userlinks > p.home > b > a");
-                document.dispose()
-                return name != null
+                let body = res.body
+                let loggedOut = body.includes("requires you to log on")
+                    || body.includes('name="UserName"')
+                    || body.includes('name="PassWord"')
+                return !loggedOut
             }
         },
 
@@ -960,6 +973,7 @@ class Ehentai extends ComicSource {
 
             let getImageFromApi = async (nl) => {
                 if(key.mpvkey) {
+                    let pageUrl = `${this.baseUrl}/s/${key.imageKeys[page]}/${this.parseUrl(comicId).id}-${page + 1}`
                     let res = await Network.post(this.apiUrl, {
                         'Content-Type': 'application/json',
                     }, {
@@ -973,7 +987,8 @@ class Ehentai extends ComicSource {
                     let json = JSON.parse(res.body)
                     return {
                         url: json.i.toString(),
-                        nl: json.s.toString()
+                        nl: json.s.toString(),
+                        pageUrl: pageUrl,
                     }
                 } else {
                     let parseImageKeyFromUrl = (url) => {
@@ -1010,23 +1025,69 @@ class Ehentai extends ComicSource {
                     image = image.substring(image.indexOf("src=\"") + 5, image.indexOf("\" style"))
                     return {
                         url: image,
-                        nl: nl
+                        nl: nl,
+                        pageUrl: url,
                     }
+                }
+            }
+
+            /**
+             * Scrape the gallery page's "Download original" link (only present
+             * when the displayed image has been resampled from the original).
+             * @param pageUrl {string}
+             * @returns {Promise<string?>}
+             */
+            let getOriginalImageUrl = async (pageUrl) => {
+                try {
+                    let res = await Network.get(pageUrl, {
+                        'cache-time': 'long',
+                        'cookie': 'nw=1'
+                    })
+                    if(res.status !== 200) {
+                        return null
+                    }
+                    let document = new HtmlDocument(res.body)
+                    let link = document.querySelectorAll('a').find(
+                        (e) => e.text?.trim()?.startsWith('Download original')
+                    )
+                    let href = link?.attributes["href"] ?? null
+                    document.dispose()
+                    return href
+                } catch(e) {
+                    return null
                 }
             }
 
             let res = await getImageFromApi(nl)
 
-            let onLoadFailed = null
+            let compressedLoadFailed = res.nl ? async () => {
+                return this.comic.onImageLoad(image, comicId, epId, res.nl)
+            } : null
 
-            if(res.nl) {
-                onLoadFailed = async () => {
-                    return this.comic.onImageLoad(image, comicId, epId, res.nl)
+            let finalUrl = res.url
+            let onLoadFailed = compressedLoadFailed
+
+            // Only try the original on the first attempt (no `nl`): retries re-scrape the same
+            // cached page and would hand back the same broken original link again, wasting
+            // the app's retry budget. Downloading originals also requires login.
+            if(!nl && this.isLogged && this.loadSetting('loadOriginalImage') && res.pageUrl) {
+                let originalUrl = await getOriginalImageUrl(res.pageUrl)
+                if(originalUrl) {
+                    finalUrl = originalUrl
+                    onLoadFailed = async () => {
+                        return {
+                            url: res.url,
+                            headers: {
+                                'referer': this.baseUrl,
+                            },
+                            onLoadFailed: compressedLoadFailed,
+                        }
+                    }
                 }
             }
 
             return {
-                url: res.url,
+                url: finalUrl,
                 headers: {
                     'referer': this.baseUrl,
                 },
@@ -1451,6 +1512,11 @@ class Ehentai extends ComicSource {
             type: "switch",
             default: false
         },
+        loadOriginalImage: {
+            title: "loadOriginalImage",
+            type: "switch",
+            default: false
+        },
     }
 
     // [Optional] translations for the strings in this config
@@ -1459,6 +1525,7 @@ class Ehentai extends ComicSource {
             "domain": "域名",
             "ehevent": "触发黎明事件",
             "hvevent": "提示HV遭遇战",
+            "loadOriginalImage": "加载原图",
             "hentaiverse": "你遇到了怪物！",
             "fight":"战斗",
             "cancel":"取消",
@@ -1496,6 +1563,7 @@ class Ehentai extends ComicSource {
             'domain': '域名',
             "ehevent": "觸發黎明事件",
             "hvevent": "提示HV遭遇戰",
+            "loadOriginalImage": "載入原圖",
             "hentaiverse": "你遇到了怪物！",
             "fight":"戰鬥",
             "cancel":"取消",
@@ -1533,6 +1601,7 @@ class Ehentai extends ComicSource {
             "domain": "Domain",
             "ehevent": "Trigger Dawn Event",
             "hvevent": "HV Encounter Alert",
+            "loadOriginalImage": "Load Original Image",
             "hentaiverse": "You have encountered a monster!",
             "fight": "Fight",
             "cancel": "Cancel",
