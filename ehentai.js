@@ -40,6 +40,33 @@ class Ehentai extends ComicSource {
         }
     }
 
+    /**
+     * Save account cookies for both e-hentai.org and exhentai.org.
+     * Blank values are skipped; `igneous` defaults to "mystery".
+     * @param cookieMap {Object<string, string>} - cookie name to value
+     */
+    setLoginCookies(cookieMap) {
+        let values = Object.assign({}, cookieMap)
+        if (!values["igneous"]) {
+            values["igneous"] = "mystery"
+        }
+        let cookies = []
+        for (let name in values) {
+            if (!values[name]) {
+                continue
+            }
+            for (let domain of [".e-hentai.org", ".exhentai.org"]) {
+                cookies.push(new Cookie({
+                    name: name,
+                    value: values[name],
+                    domain: domain
+                }))
+            }
+        }
+        Network.setCookies('https://e-hentai.org', cookies)
+        Network.setCookies('https://exhentai.org', cookies)
+    }
+
     async checkEHEvent() {
         if (!this.isLogged) {
             return;
@@ -76,7 +103,10 @@ class Ehentai extends ComicSource {
          * [Optional] login with webview
          */
         loginWithWebview: {
-            url: "https://forums.e-hentai.org/index.php?act=Login&CODE=00",
+            // The forum login page is behind a Cloudflare challenge, so start from the main
+            // site's login page instead. Its form posts to the forum, which bounces back to
+            // e-hentai.org once the credentials are accepted.
+            url: "https://e-hentai.org/bounce_login.php?b=d&bt=1-1",
             /**
              * check login status
              * @param url {string} - current url
@@ -84,14 +114,24 @@ class Ehentai extends ComicSource {
              * @returns {boolean} - return true if login success
              */
             checkStatus: (url, title) => {
+                if (/^https?:\/\/e-hentai\.org(\/|$)/.test(url) && !url.includes("bounce_login.php")) {
+                    return true
+                }
+                // logged in on the forum itself without being bounced back
                 return title === "E-Hentai Forums";
             },
             onLoginSuccess: async () => {
-                let cookies = await Network.getCookies("https://forums.e-hentai.org")
-                cookies.forEach((cookie) => {
-                    cookie.domain = ".exhentai.org"
-                })
-                Network.setCookies("https://exhentai.org", cookies)
+                let cookies = [
+                    ...(await Network.getCookies("https://forums.e-hentai.org") ?? []),
+                    ...(await Network.getCookies("https://e-hentai.org") ?? []),
+                ]
+                let cookieMap = {}
+                for (let cookie of cookies) {
+                    if (["ipb_member_id", "ipb_pass_hash", "sk", "igneous"].includes(cookie.name)) {
+                        cookieMap[cookie.name] = cookie.value
+                    }
+                }
+                this.setLoginCookies(cookieMap)
             },
         },
 
@@ -119,25 +159,12 @@ class Ehentai extends ComicSource {
                 if (!values[0] || !values[1]) {
                     return false
                 }
-                let cookies = []
-                for (let i = 0; i < values.length; i++) {
-                    if (!values[i]) {
-                        continue // skip blank optional cookies instead of storing empties
-                    }
-                    cookies.push(new Cookie({
-                        name: fields[i],
-                        value: values[i],
-                        domain: ".e-hentai.org"
-                    }))
-                    cookies.push(new Cookie({
-                        name: fields[i],
-                        value: values[i],
-                        domain: ".exhentai.org"
-                    }))
-                }
+                let cookieMap = {}
+                fields.forEach((name, i) => {
+                    cookieMap[name] = values[i]
+                })
                 Network.deleteCookies('https://e-hentai.org')
-                Network.setCookies('https://e-hentai.org', cookies)
-                Network.setCookies('https://exhentai.org', cookies)
+                this.setLoginCookies(cookieMap)
                 // The old check scraped forums.e-hentai.org, but the forum is now behind
                 // anti-bot protection (returns 403 to app clients), so that request never
                 // returned 200 and login always failed with "Invalid cookies". Validate
